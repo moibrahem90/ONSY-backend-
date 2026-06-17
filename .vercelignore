@@ -1,0 +1,6 @@
+node_modules
+ai_engine
+.git
+.github
+.env.development
+config/.env.development

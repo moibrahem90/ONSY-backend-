@@ -161,7 +161,7 @@ function generateFallbackRealtimeAnalysis(eeg, logs, messages) {
         "It is absolutely wonderful that you are experiencing this joy! Take a moment to fully immerse yourself in this positive energy and let it radiate through your entire body.", 
         "Keep nurturing whatever it is that brought this light into your day. Sharing your happiness with someone else can magnify these beautiful feelings for both of you.", 
         "Consider starting a gratitude journal tonight. Documenting the specific things that made you smile today will create a beautiful memory bank you can revisit whenever you need a boost."
-      ];
+      ]  
     }
   }
 

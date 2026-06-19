@@ -1,263 +1,196 @@
 import axios from 'axios';
-import Session from '../../DB/models/Session.js';
-import successResponse from "../../common/utils/response.success.js";
-import { AI_ENGINE_URL, GROQ_API_KEY } from "../../../config/config.service.js";
-import { triggerRealtimeAnalysis } from "../../services/analysis.service.js";
+import moodModel from '../DB/models/mood.model.js';
+import EEGReading from '../DB/models/EEGReading.model.js';
+import Session from '../DB/models/Session.js';
+import AIAnalysis from '../DB/models/AIAnalysis.model.js';
+import { getIO } from '../socket/index.js';
 
-const LEVEL_INFO = {
-  1: { label: 'Normal',            color: 'green',  advice: 'You seem to be in a good emotional state. Keep taking care of yourself!' },
-  2: { label: 'Mild stress',       color: 'yellow', advice: 'You may need some rest. Try a short break, deep breathing, or a relaxing activity.' },
-  3: { label: 'Moderate distress', color: 'orange', advice: 'It sounds like you are going through a tough time. Consider talking to a trusted friend or family member.' },
-  4: { label: 'High risk',         color: 'red',    advice: 'Your emotional state suggests you need professional support. Please reach out to a mental health specialist.' }
-};
+export const triggerRealtimeAnalysis = (userId, eegSessionId = null) => {
+  return Promise.all([
+    moodModel.find({ user: userId }).sort({ createdAt: -1 }).limit(10),
+    eegSessionId 
+      ? EEGReading.find({ sessionId: eegSessionId, userId })
+      : EEGReading.findOne({ userId }).sort({ timestamp: -1 }).then(latest => 
+          latest ? EEGReading.find({ sessionId: latest.sessionId, userId }) : []
+        ),
+    Session.findOne({ user: userId }).sort({ updatedAt: -1 })
+  ])
+  .then(([moodLogs, eegReadings, recentSession]) => {
+    let eegMetrics = { excitement: 0, stress: 0, focus: 0, relaxation: 0, engagement: 0, interest: 0 };
+    let sessionId = eegSessionId || (eegReadings.length > 0 ? eegReadings[0].sessionId : null);
 
-function buildSystemPrompt(level, userName) {
-  const levelInfo = LEVEL_INFO[level] || LEVEL_INFO[1];
-  return `You are ONSY, a compassionate AI mental health support chatbot. You are NOT a medical professional and must never diagnose.\n\nUser: ${userName || 'User'}\nLevel: ${level} (${levelInfo.label})\nGuidance: ${levelInfo.advice}\n\nRules:\n1. Be warm, empathetic, non-judgmental.\n2. Match tone to emotional state.\n3. Ask one follow-up question at a time.\n4. For Level 3-4: gently encourage professional help.\n5. For Level 4: always include a crisis resource.\n6. Never claim to diagnose or replace a therapist.\n7. Use CBT principles: acknowledge, validate, reframe.\n8. Keep responses to 3-5 sentences.\n9. Vary responses naturally.\n10. Reference earlier things the user said.`;
-}
-
-export const sendMessage = async (req, res, next) => {
-  try {
-    const { message, sessionId } = req.body;
-    if (!message?.trim()) {
-      return next(new Error('Message is required.', { cause: 400 }));
+    if (eegReadings && eegReadings.length > 0) {
+      const sums = { excitement: 0, stress: 0, focus: 0, relaxation: 0, engagement: 0, interest: 0, longTermExcitement: 0 };
+      const counts = { excitement: 0, stress: 0, focus: 0, relaxation: 0, engagement: 0, interest: 0, longTermExcitement: 0 };
+      
+      for (const reading of eegReadings) {
+        if (reading.metrics?.excitement !== null && reading.metrics?.excitement !== undefined) { sums.excitement += reading.metrics.excitement; counts.excitement++; }
+        if (reading.metrics?.stress !== null && reading.metrics?.stress !== undefined) { sums.stress += reading.metrics.stress; counts.stress++; }
+        if (reading.metrics?.focus !== null && reading.metrics?.focus !== undefined) { sums.focus += reading.metrics.focus; counts.focus++; }
+        if (reading.metrics?.relaxation !== null && reading.metrics?.relaxation !== undefined) { sums.relaxation += reading.metrics.relaxation; counts.relaxation++; }
+        if (reading.metrics?.engagement !== null && reading.metrics?.engagement !== undefined) { sums.engagement += reading.metrics.engagement; counts.engagement++; }
+        if (reading.metrics?.interest !== null && reading.metrics?.interest !== undefined) { sums.interest += reading.metrics.interest; counts.interest++; }
+        if (reading.metrics?.longTermExcitement !== null && reading.metrics?.longTermExcitement !== undefined) { sums.longTermExcitement += reading.metrics.longTermExcitement; counts.longTermExcitement++; }
+      }
+      
+      for (const key in sums) {
+        eegMetrics[key] = counts[key] > 0 ? (sums[key] / counts[key]) : 0;
+      }
     }
 
-    let analysis = null;
-    try {
-      const nlpRes = await axios.post(`${AI_ENGINE_URL || 'http://localhost:8000'}/analyze`, { text: message }, { timeout: 10000 });
-      analysis = nlpRes.data;
-    } catch (e) {
-      console.warn('AI engine unavailable, using fallback');
-      analysis = fallbackAnalysis(message);
+    let recentMessages = [];
+    let conversationId = null;
+    if (recentSession && recentSession.messages) {
+      conversationId = recentSession._id;
+      recentMessages = recentSession.messages
+        .filter(m => m.role === 'user')
+        .slice(-10)
+        .map(m => ({ _id: m._id, content: m.content, timestamp: m.timestamp }));
     }
 
-    const mentalLevel = analysis.mental_level || 1;
-    const systemPrompt = buildSystemPrompt(mentalLevel, req.auth.firstName);
-
-    let session;
-    if (sessionId) {
-      session = await Session.findOne({ _id: sessionId, user: req.auth._id });
-    }
-    if (!session) {
-      session = new Session({ user: req.auth._id, messages: [] });
-    }
-
-    const history = session.messages.slice(-10).map(m => ({
-      role: m.role === 'assistant' ? 'assistant' : 'user',
-      content: m.content
+    const mappedMoodLogs = moodLogs.map(m => ({
+      _id: m._id,
+      mood: m.mood,
+      intensity: m.intensity,
+      notes: m.notes,
+      timestamp: m.createdAt
     }));
 
-    const groqRes = await axios.post(
-      'https://api.groq.com/openai/v1/chat/completions',
-      {
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 600,
-        temperature: 0.75,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...history,
-          { role: 'user', content: message }
-        ]
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 30000
-      }
-    );
-
-    const reply = groqRes.data.choices[0].message.content;
-
-    session.messages.push({ role: 'user', content: message, analysis });
-    session.messages.push({ role: 'assistant', content: reply });
-    session.updatedAt = Date.now();
-    await session.save();
-
-    try {
-      await triggerRealtimeAnalysis(req.auth._id);
-    } catch (e) {
-      console.error("Realtime analysis failed:", e);
-    }
-
-    successResponse({
-      res,
-      status: 200,
-      message: "Message sent",
-      data: {
-        reply,
-        sessionId: session._id,
-        analysis: {
-          dominant_emotion: analysis.dominant_emotion,
-          sentiment: analysis.sentiment,
-          mental_level: mentalLevel,
-          level_label: LEVEL_INFO[mentalLevel]?.label,
-          level_color: LEVEL_INFO[mentalLevel]?.color,
-          risk_score: analysis.risk_score,
-          emotions: analysis.emotions
+    return axios.post(`${process.env.AI_ENGINE_URL || 'http://localhost:8000'}/analyze/realtime`, {
+      userId,
+      moodLogs: mappedMoodLogs,
+      eegMetrics,
+      recentMessages
+    }, { timeout: 10000 })
+    .then(response => response.data)
+    .catch(err => {
+      console.warn('Realtime AI engine unavailable, using fallback. Error:', err.message);
+      return generateFallbackRealtimeAnalysis(eegMetrics, mappedMoodLogs, recentMessages);
+    })
+    .then(aiResponse => {
+      const newAnalysis = new AIAnalysis({
+        userId,
+        type: "realtime",
+        linkedMoodLogs: mappedMoodLogs.map(m => m._id),
+        linkedEEGSession: sessionId,
+        linkedConversation: conversationId,
+        result: {
+          ...aiResponse,
+          eegMetrics
         }
+      });
+
+      return newAnalysis.save();
+    }).then(savedAnalysis => {
+      try {
+        getIO().to(userId.toString()).emit('analysis:update', savedAnalysis);
+      } catch (ioErr) {
+        // Socket.io not initialized on Vercel, ignore emit error
       }
+      return savedAnalysis;
     });
-
-  } catch (err) {
-    next(err);
-  }
+  })
+  .catch(err => console.error('Analysis trigger failed:', err));
 };
 
-export const newSession = async (req, res, next) => {
-  try {
-    const session = await Session.create({ user: req.auth._id, messages: [] });
-    successResponse({
-      res,
-      status: 201,
-      message: "New session created",
-      data: { sessionId: session._id }
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-function fallbackAnalysis(text) {
-  const lower = text.toLowerCase();
-  const isSad    = ['sad','depressed','cry','hopeless','empty','lonely'].some(w => lower.includes(w));
-  const isAnx    = ['anxious','worried','panic','nervous','scared','fear'].some(w => lower.includes(w));
-  const isStress = ['stressed','overwhelmed','tired','exhausted'].some(w => lower.includes(w));
-  const isHappy  = ['happy','good','great','excited','joy', 'glad'].some(w => lower.includes(w));
-  const isRisk   = ['suicide','die','hurt myself','end it', 'kill myself', 'kill'].some(w => lower.includes(w));
+function generateFallbackRealtimeAnalysis(eeg, logs, messages) {
+  // Simple heuristic based on EEG if available
+  let risk = 10;
   let level = 1;
-  if (isRisk) level = 4;
-  else if (isSad || isAnx) level = 3;
-  else if (isStress) level = 2;
-  let happiness = isHappy ? 0.7 : 0.05;
-  let sadness = isSad ? 0.6 : 0.05;
-  let anxiety = isAnx ? 0.5 : 0.05;
-  let stress = isStress ? 0.5 : 0.05;
-  let anger = 0.05;
-  let fear = isAnx ? 0.3 : 0.05;
-
-  if (!isRisk && !isSad && !isAnx && !isStress && !isHappy) {
-    happiness = 0.2; sadness = 0.1; anxiety = 0.1; stress = 0.1; anger = 0.1; fear = 0.1;
+  let dom = 'neutral';
+  let recs = ["Take a deep breath and stay hydrated.", "Consider taking a short 5-minute walk."];
+  
+  if (eeg && (eeg.stress > 0.6 || eeg.excitement > 0.8)) {
+    risk = 45;
+    level = 2;
+    dom = 'stress';
+    recs = ["Your stress levels appear elevated.", "Try a 5-minute guided meditation.", "Listen to calming music."];
+  }
+  
+  if (logs && logs.length > 0) {
+    const recent = logs[0];
+    if (recent.mood === 'Sad' || recent.mood === 'Angry') {
+      risk = Math.max(risk, 60);
+      level = Math.max(level, 3);
+      dom = recent.mood.toLowerCase();
+      recs.push("We noticed you logged a negative mood. Consider reaching out to a friend.");
+    }
   }
 
-  const sum = happiness + sadness + anxiety + stress + anger + fear;
-  
-  return {
-    dominant_emotion: isRisk ? 'distress' : isSad ? 'sadness' : isAnx ? 'anxiety' : isStress ? 'stress' : isHappy ? 'happiness' : 'neutral',
-    sentiment: isHappy ? 'positive' : (isSad || isAnx || isRisk) ? 'negative' : 'neutral',
-    sentiment_score: isHappy ? 0.7 : (isSad || isRisk) ? -0.8 : 0,
-    mental_level: level,
-    risk_score: isRisk ? 85 : isSad ? 55 : isAnx ? 45 : isStress ? 30 : 10,
-    emotions: {
-      happiness: +(happiness / sum).toFixed(3),
-      sadness: +(sadness / sum).toFixed(3),
-      anxiety: +(anxiety / sum).toFixed(3),
-      stress: +(stress / sum).toFixed(3),
-      anger: +(anger / sum).toFixed(3),
-      fear: +(fear / sum).toFixed(3)
+  if (messages && messages.length > 0) {
+    const recentText = messages[messages.length - 1].content.toLowerCase();
+    const isSad    = ['sad','depressed','cry','hopeless','empty','lonely'].some(w => recentText.includes(w));
+    const isAnx    = ['anxious','worried','panic','nervous','scared','fear'].some(w => recentText.includes(w));
+    const isStress = ['stressed','overwhelmed','tired','exhausted'].some(w => recentText.includes(w));
+    const isHappy  = ['happy','good','great','excited','joy', 'glad'].some(w => recentText.includes(w));
+    const isRisk   = ['suicide','die','hurt myself','end it', 'kill myself', 'kill'].some(w => recentText.includes(w));
+    
+    if (isRisk) { 
+      level = 4; dom = 'distress'; risk = 85; 
+      recs = [
+        "We hear you, and we want you to know that your life has profound value. Please, pause for a moment and reach out to a mental health professional or emergency service immediately.", 
+        "You don't have to carry this heavy burden all by yourself. There are compassionate crisis counselors available 24/7 who are ready to listen and support you through this dark time.", 
+        "Please remember that this intense pain is temporary, even when it feels endless. Reach out to a trusted loved one or helpline right now—your presence in this world matters deeply."
+      ];
     }
+    else if (isSad || isAnx) { 
+      level = Math.max(level, 3); dom = isSad ? 'sadness' : 'anxiety'; risk = Math.max(risk, 55); 
+      recs = isSad 
+        ? [
+            "It is completely okay to feel sad; acknowledge your emotions without judgment. Wrap yourself in a warm blanket, make your favorite soothing tea, and allow yourself the space to just be.", 
+            "When the world feels heavy, gentle self-care is vital. Consider reaching out to a close friend who can offer a listening ear and a warm presence when you need it most.",
+            "Sometimes, simply stepping outside to feel the sun on your face or listening to the gentle rhythm of nature can provide a small but meaningful moment of comfort in a sorrowful day."
+          ]
+        : [
+            "Anxiety can feel like a storm, but you are the anchor. Try a grounding exercise: focus on 5 things you can see, 4 you can touch, 3 you can hear, 2 you can smell, and 1 you can taste to bring yourself back to the present.", 
+            "Find a quiet, safe space to sit comfortably. Place your hand on your heart and take slow, deep breaths—inhale calm for 4 seconds, hold for 4, and exhale the tension for 6 seconds.",
+            "Remember that these anxious thoughts are just passing clouds, not the sky itself. Be gentle with yourself today, and take things one small, manageable step at a time."
+          ];
+    }
+    else if (isStress) { 
+      level = Math.max(level, 2); dom = 'stress'; risk = Math.max(risk, 30); 
+      recs = [
+        "You are carrying a lot right now, and it's essential to give yourself permission to pause. Step away from your current tasks, stretch your body, and take a deeply restorative 10-minute break.", 
+        "Physical movement can help release the built-up tension in your mind and body. Consider a mindful, leisurely walk outside to let the fresh air clear your thoughts and reset your perspective.",
+        "Try writing down everything that is overwhelming you on a piece of paper. Once it's out of your head, you can slowly tackle it piece by piece, or simply leave it there for tomorrow."
+      ];
+    }
+    else if (isHappy) { 
+      level = 1; dom = 'happiness'; risk = 10; 
+      recs = [
+        "It is absolutely wonderful that you are experiencing this joy! Take a moment to fully immerse yourself in this positive energy and let it radiate through your entire body.", 
+        "Keep nurturing whatever it is that brought this light into your day. Sharing your happiness with someone else can magnify these beautiful feelings for both of you.", 
+        "Consider starting a gratitude journal tonight. Documenting the specific things that made you smile today will create a beautiful memory bank you can revisit whenever you need a boost."
+      ];
+    }
+  }
+
+  // Calculate base emotion scores
+  let happiness = (level === 1 && dom === 'happiness') ? 0.7 : (level === 1 ? 0.4 : 0.05);
+  let sadness = (dom === 'sadness' || dom === 'sad') ? 0.6 : 0.05;
+  let anxiety = (dom === 'anxiety' || dom === 'stress') ? 0.5 : 0.05;
+  let stress = (eeg && eeg.stress > 0) ? eeg.stress : (level >= 2 ? 0.4 : 0.1);
+  let anger = (dom === 'angry') ? 0.5 : 0.05;
+  let fear = 0.05;
+
+  // Normalize scores to ensure they sum perfectly to 1.0 (100%)
+  const sum = happiness + sadness + anxiety + stress + anger + fear;
+  happiness = +(happiness / sum).toFixed(3);
+  sadness = +(sadness / sum).toFixed(3);
+  anxiety = +(anxiety / sum).toFixed(3);
+  stress = +(stress / sum).toFixed(3);
+  anger = +(anger / sum).toFixed(3);
+  fear = +(fear / sum).toFixed(3);
+
+  return {
+    dominant_emotion: dom,
+    sentiment: level >= 3 ? 'negative' : (level === 2 ? 'neutral' : 'positive'),
+    sentiment_score: level >= 3 ? -0.5 : (level === 2 ? 0 : 0.6),
+    mental_level: level,
+    risk_score: risk,
+    emotions: {
+      happiness, sadness, anxiety, stress, anger, fear
+    },
+    recommendations: recs
   };
 }
-
-export const allSessions = async (req, res, next) => {
-  try {
-    const sessions = await Session.find({ user: req.auth._id })
-      .sort({ updatedAt: -1 })
-      .select('_id createdAt updatedAt summary messages')
-      .lean();
-
-    const result = sessions.map(s => ({
-      id: s._id,
-      date: s.updatedAt,
-      messageCount: s.messages.length,
-      preview: s.messages.find(m => m.role === 'user')?.content?.slice(0, 60) + '...' || '',
-      avgLevel: s.summary?.dominant_level || null
-    }));
-
-    successResponse({
-      res,
-      status: 200,
-      message: "All sessions",
-      data: result
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const oneSession = async (req, res, next) => {
-  try {
-    const session = await Session.findOne({ _id: req.params.id, user: req.auth._id });
-    if (!session) {
-      return next(new Error('Session not found.', { cause: 404 }));
-    }
-    successResponse({
-      res,
-      status: 200,
-      message: "Session retrieved",
-      data: session
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const emotionalTrend = async (req, res, next) => {
-  try {
-    const sessions = await Session.find({ user: req.auth._id })
-      .sort({ createdAt: -1 })
-      .limit(30)
-      .lean();
-
-    const userMessages = sessions.flatMap(s =>
-      s.messages.filter(m => m.role === 'user' && m.analysis)
-    );
-
-    if (!userMessages.length) {
-      return successResponse({
-        res,
-        status: 200,
-        message: "No message data available",
-        data: { empty: true }
-      });
-    }
-
-    const avgRisk = userMessages.reduce((sum, m) => sum + (m.analysis.risk_score || 0), 0) / userMessages.length;
-    const sentimentCounts = { positive: 0, negative: 0, neutral: 0 };
-    const levelCounts = { 1: 0, 2: 0, 3: 0, 4: 0 };
-
-    userMessages.forEach(m => {
-      if (m.analysis.sentiment) sentimentCounts[m.analysis.sentiment]++;
-      if (m.analysis.mental_level) levelCounts[m.analysis.mental_level]++;
-    });
-
-    const emotionTotals = {};
-    userMessages.forEach(m => {
-      if (m.analysis.emotions) {
-        Object.entries(m.analysis.emotions).forEach(([k, v]) => {
-          emotionTotals[k] = (emotionTotals[k] || 0) + v;
-        });
-      }
-    });
-    const avgEmotions = Object.fromEntries(
-      Object.entries(emotionTotals).map(([k, v]) => [k, +(v / userMessages.length).toFixed(3)])
-    );
-
-    successResponse({
-      res,
-      status: 200,
-      message: "Emotional trend",
-      data: {
-        avgRisk: +avgRisk.toFixed(1),
-        sentimentCounts,
-        levelCounts,
-        avgEmotions,
-        totalMessages: userMessages.length
-      }
-    });
-  } catch (err) {
-    next(err);
-  }
-};
